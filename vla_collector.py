@@ -161,8 +161,8 @@ class VLACollector:
         wrist_cam_path = "/World/Franka/panda_hand/wrist_camera"
         self._configure_camera(
             path=wrist_cam_path,
-            translation=(0.0, 0.0, 0.06),
-            rotation_xyz=(0.0, 180.0, -90.0),
+            translation=(0.05, 0.0, 0.04),
+            rotation_xyz=(0.0, 165.0, -90.0),
             focal_length=18.0,
         )
 
@@ -290,17 +290,10 @@ class VLACollector:
                 positions.append(np.array([x, y]))
 
             z = TABLE_Z + CUBE_HALF_SIZE
-            # Set pose via existing translate/orient ops or raw attributes
-            translate_attr = prim.GetAttribute("xformOp:translate")
-            if translate_attr and translate_attr.IsValid():
-                translate_attr.Set(Gf.Vec3d(float(positions[-1][0]), float(positions[-1][1]), float(z)))
-            else:
-                xform = UsdGeom.Xformable(prim)
-                xform.AddTranslateOp().Set(Gf.Vec3d(float(positions[-1][0]), float(positions[-1][1]), float(z)))
-            # Reset rotation via existing orient op
-            orient_attr = prim.GetAttribute("xformOp:orient")
-            if orient_attr and orient_attr.IsValid():
-                orient_attr.Set(Gf.Quatd(1.0, 0.0, 0.0, 0.0))
+            from omni.isaac.core.prims import RigidPrim
+            cube_rigid = RigidPrim(prim_path=path)
+            cube_rigid.initialize()
+            cube_rigid.set_world_pose(position=np.array([float(positions[-1][0]), float(positions[-1][1]), float(z)]))
 
         return {"status": "success", "num_cubes_placed": len(positions)}
 
@@ -321,27 +314,12 @@ class VLACollector:
     # ------------------------------------------------------------------
     # Robot state reading
     # ------------------------------------------------------------------
-    def _init_articulation(self):
-        """Initialize the Franka articulation once, caching it for reuse."""
-        if hasattr(self, "_art") and self._art is not None:
-            return self._art
-
-        from omni.isaac.dynamic_control import _dynamic_control
-        self._dc = _dynamic_control.acquire_dynamic_control_interface()
-        self._art_handle = self._dc.get_articulation(FRANKA_PRIM)
-        if self._art_handle == _dynamic_control.INVALID_HANDLE:
-            # Fallback: try via core API with world's physics sim view
-            self._dc = None
-            self._art_handle = None
-        self._art = True  # mark as initialized
-        return self._art
-
     def get_robot_state(self):
         """Read current joint positions, velocities, EE pose, and gripper state."""
-        self._init_articulation()
-
         joint_positions = np.zeros(9, dtype=np.float32)
         joint_velocities = np.zeros(9, dtype=np.float32)
+        ee_pos = np.zeros(3, dtype=np.float32)
+        ee_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
         # Prefer robot articulation state if available
         if self.manipulator is not None:
@@ -353,42 +331,12 @@ class VLACollector:
             if jv is not None:
                 n = min(len(jv), 9)
                 joint_velocities[:n] = jv[:n]
-        elif self._dc is not None and self._art_handle is not None:
-            from omni.isaac.dynamic_control import _dynamic_control
-            dof_states = self._dc.get_articulation_dof_states(self._art_handle, _dynamic_control.STATE_ALL)
-            if dof_states is not None:
-                n = min(len(dof_states["pos"]), 9)
-                joint_positions[:n] = dof_states["pos"][:n]
-                joint_velocities[:n] = dof_states["vel"][:n]
-
-        # End-effector pose from the panda_hand link
-        hand_path = f"{FRANKA_PRIM}/{WRIST_LINK}"
-        ee_pos = np.zeros(3, dtype=np.float32)
-        ee_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        
-        ee_found = False
-        if self._dc is not None:
-            from omni.isaac.dynamic_control import _dynamic_control
-            body_handle = self._dc.get_rigid_body(hand_path)
-            if body_handle != _dynamic_control.INVALID_HANDLE:
-                tf = self._dc.get_rigid_body_pose(body_handle)
-                ee_pos = np.array([tf.p.x, tf.p.y, tf.p.z], dtype=np.float32)
-                ee_quat = np.array([tf.r.w, tf.r.x, tf.r.y, tf.r.z], dtype=np.float32)
-                ee_found = True
-        
-        if not ee_found:
-            # Fallback: USD compute with current time, not Default time.
-            hand_prim = self.stage.GetPrimAtPath(hand_path)
-            if hand_prim.IsValid():
-                xformable = UsdGeom.Xformable(hand_prim)
-                from omni.isaac.core.utils.stage import get_current_stage
-                time_code = Usd.TimeCode(omni.timeline.get_timeline_interface().get_current_time() * self.stage.GetTimeCodesPerSecond()) if hasattr(omni, 'timeline') else Usd.TimeCode.Default()
-                world_transform = xformable.ComputeLocalToWorldTransform(time_code)
-                translation = world_transform.ExtractTranslation()
-                rotation = world_transform.ExtractRotationQuat()
-                ee_pos = np.array([translation[0], translation[1], translation[2]], dtype=np.float32)
-                im = rotation.GetImaginary()
-                ee_quat = np.array([rotation.GetReal(), im[0], im[1], im[2]], dtype=np.float32)
+                
+            e_pos, e_quat = self.manipulator.gripper.get_world_pose()
+            if e_pos is not None:
+                ee_pos = np.array(e_pos, dtype=np.float32)
+            if e_quat is not None:
+                ee_quat = np.array(e_quat, dtype=np.float32)
 
         # Gripper width = sum of finger joint positions
         gripper_width = float(joint_positions[7] + joint_positions[8])
